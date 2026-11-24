@@ -83,6 +83,22 @@
       box-decoration-break: clone;
       -webkit-box-decoration-break: clone;
     }
+    /* Cùng một chiều rộng nội dung giữa xem trước, PDF và in trực tiếp. */
+    #a4-preview-sheet-container {
+      width: 794px;
+      max-width: 100%;
+      box-sizing: border-box;
+      padding: 53px;
+    }
+    @media (max-width: 700px) {
+      #a4-preview-sheet-container { padding: 18px; }
+    }
+    @media print {
+      #print-only-mount .hskk-a4-worksheet {
+        width: 182mm !important;
+        max-width: 100% !important;
+      }
+    }
     /* CSS chuyên biệt cho chế độ In trực tiếp (Ctrl+P / Window Print) */
     @media print {
       @page {
@@ -1414,6 +1430,110 @@
       return safe.innerHTML;
     }
 
+    // Chuyển ghi chú HTML thành văn bản thuần + các khoảng tô màu chính xác.
+    // Các thẻ <div>/<p>/<br> của contenteditable được quy về một ký tự xuống dòng,
+    // KHÔNG đưa chúng vào mẫu PDF: nếu dùng kèm white-space:pre-wrap sẽ nhảy dòng.
+    function parseNoteRichContent(markup, trusted = false) {
+      const root = document.createElement('div');
+      root.innerHTML = trusted ? String(markup || '') : sanitizeNoteMarkup(markup);
+      let text = '';
+      const spans = [];
+      let caret = null;
+      const append = (value, color) => {
+        if (!value) return;
+        const start = text.length;
+        text += value.replace(/\r\n?/g, '\n');
+        if (color && color !== 'clear') spans.push({start, end: text.length, color});
+      };
+      const visit = (parent, color) => {
+        for (const node of Array.from(parent.childNodes)) {
+          if (node.nodeType === Node.TEXT_NODE) {
+            append(node.nodeValue || '', color);
+            continue;
+          }
+          if (node.nodeType !== Node.ELEMENT_NODE) continue;
+          if (node.hasAttribute('data-note-caret')) {
+            caret = text.length;
+            continue;
+          }
+          if (node.tagName === 'BR') {
+            append('\n');
+            continue;
+          }
+          if (node.tagName === 'DIV' || node.tagName === 'P') {
+            // Một block mới chỉ thêm MỘT dấu xuống dòng khi cần.
+            if (text.length && !text.endsWith('\n')) append('\n');
+            const before = text.length;
+            visit(node, color);
+            if (before === text.length && node.childNodes.length === 0) append('\n');
+            continue;
+          }
+          const newColor = node.tagName === 'MARK' && NOTE_HIGHLIGHT_COLORS[node.dataset.noteHighlight]
+            ? node.dataset.noteHighlight : color;
+          visit(node, newColor);
+        }
+      };
+      visit(root, null);
+      return {text, spans, caret};
+    }
+
+    // Văn bản được lưu một lần; marker chỉ bao đúng đoạn chữ tương ứng, không tạo DIV/P.
+    function makeNoteMarkupFromSpans(text, spans) {
+      text = String(text || '');
+      const colors = new Array(text.length).fill(null);
+      for (const span of spans || []) {
+        if (!NOTE_HIGHLIGHT_COLORS[span.color] || span.color === 'clear') continue;
+        for (let i = Math.max(0, span.start); i < Math.min(text.length, span.end); i++) colors[i] = span.color;
+      }
+      let output = '', start = 0, previous = colors[0] || null;
+      const chunk = (end, color) => {
+        if (end <= start) return;
+        const value = escapeHtml(text.slice(start, end));
+        if (color) output += `<mark data-note-highlight="${color}" style="background-color:${NOTE_HIGHLIGHT_COLORS[color]};color:inherit">${value}</mark>`;
+        else output += value;
+      };
+      for (let i = 0; i < text.length; i++) {
+        // Ký tự xuống dòng luôn đứng NGOÀI MARK; tránh nền tô tràn sang dòng kế.
+        if (text[i] === '\n') {
+          chunk(i, previous);
+          output += '\n';
+          start = i + 1;
+          previous = i + 1 < text.length ? colors[i + 1] : null;
+          continue;
+        }
+        const next = i + 1 < text.length ? colors[i + 1] : null;
+        if (next !== previous || i === text.length - 1) {
+          chunk(i + 1, previous);
+          start = i + 1;
+          previous = next;
+        }
+      }
+      return output;
+    }
+
+    // Đọc caret từ DOM clone: hoạt động cả khi selection bắt đầu ở DIV hoặc ở giữa MARK.
+    function noteSelectionOffset(editor, node, offset) {
+      const indices = [];
+      for (let n = node; n && n !== editor; n = n.parentNode) {
+        if (!n.parentNode) return null;
+        indices.push(Array.prototype.indexOf.call(n.parentNode.childNodes, n));
+      }
+      if (node !== editor && !editor.contains(node)) return null;
+      const copy = editor.cloneNode(true);
+      let target = copy;
+      for (const i of indices.reverse()) {
+        target = target.childNodes[i];
+        if (!target) return null;
+      }
+      const range = document.createRange();
+      range.setStart(target, offset);
+      range.collapse(true);
+      const marker = document.createElement('span');
+      marker.dataset.noteCaret = '1';
+      range.insertNode(marker);
+      return parseNoteRichContent(copy.innerHTML, true).caret;
+    }
+
     function noteEditorPlainText() {
       const editor = document.getElementById('note-textarea');
       return editor ? editor.innerText.replace(/\r\n?/g, '\n') : '';
@@ -1426,7 +1546,9 @@
       editor.textContent = plain;
       if (typeof rich === 'string' && rich.length > 0) {
         const safe = sanitizeNoteMarkup(rich);
-        editor.innerHTML = safe;
+        const parsed = parseNoteRichContent(safe);
+        editor.innerHTML = parsed.text.replace(/\n+$/, '') === plain.replace(/\n+$/, '')
+          ? makeNoteMarkupFromSpans(plain, parsed.spans) : safe;
         // Ghi chú plain text cũ vẫn là nguồn dữ liệu chính nếu hai bản không khớp.
         // Markup được ghi đồng bộ với ghi chú; giữ định dạng ngay cả khi HTML thay đổi xuống dòng.
       }
@@ -1451,26 +1573,24 @@
         showToast('Hãy bôi đen đoạn chữ cần tô sáng trong ghi chú.', 'info');
         return;
       }
-      // Bọc từng đoạn text riêng để tô màu được cả lựa chọn qua nhiều dòng/đoạn.
-      const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT);
-      const parts = [];
-      while (walker.nextNode()) {
-        const node = walker.currentNode;
-        if (node.nodeValue.length === 0 || !range.intersectsNode(node)) continue;
-        const from = range.startContainer === node ? range.startOffset : 0;
-        const to = range.endContainer === node ? range.endOffset : node.nodeValue.length;
-        if (to > from) parts.push({node, from, to});
+      const parsed = parseNoteRichContent(editor.innerHTML);
+      const plain = noteEditorPlainText();
+      const from = noteSelectionOffset(editor, range.startContainer, range.startOffset);
+      const to = noteSelectionOffset(editor, range.endContainer, range.endOffset);
+      if (from === null || to === null || from >= to || parsed.text !== plain) {
+        showToast('Chưa thể xác định chính xác đoạn tô. Hãy chọn lại chữ trong ghi chú.', 'warning');
+        return;
       }
-      for (const {node, from, to} of parts) {
-        if (to < node.nodeValue.length) node.splitText(to);
-        const chosen = from > 0 ? node.splitText(from) : node;
-        const mark = document.createElement('mark');
-        mark.dataset.noteHighlight = color;
-        mark.style.backgroundColor = NOTE_HIGHLIGHT_COLORS[color];
-        mark.style.color = 'inherit';
-        chosen.parentNode.replaceChild(mark, chosen);
-        mark.appendChild(chosen);
+      // Gộp màu theo offset ký tự, không lồng các thẻ mark gây lệch vùng tô.
+      const spans = parsed.spans.filter(span => span.end > span.start);
+      const clipped = [];
+      for (const span of spans) {
+        if (span.end <= from || span.start >= to) { clipped.push(span); continue; }
+        if (span.start < from) clipped.push({...span, end: from});
+        if (span.end > to) clipped.push({...span, start: to});
       }
+      if (color !== 'clear') clipped.push({start: from, end: to, color});
+      editor.innerHTML = makeNoteMarkupFromSpans(plain, clipped);
       if (selection) selection.removeAllRanges();
       lastNoteSelection = null;
       handleNoteInput();
@@ -1597,11 +1717,11 @@
 - - Phần II — Nội dung bài nói / Dàn ý của học viên (口语草稿 / 回答内容): Giữ nguyên xuống dòng hoặc khung dòng kẻ A4
      */
     function getPrintableNoteHtml(topicId) {
-      const plain = String(state.notes[topicId] || '');
-      const markup = state.noteMarkup[topicId];
-      if (!markup) return escapeHtml(plain);
-      const safe = sanitizeNoteMarkup(markup);
-      return safe;
+      // Tô sáng chỉ dành cho khung ghi chú. Toàn bộ bản xem trước / bản in /
+      // PDF từng đề / sổ tay PDF đều dùng chính văn bản thuần đã lưu,
+      // giữ nguyên ký tự xuống dòng mà không đưa thẻ <mark> vào trang in.
+      const plain = String(state.notes[topicId] || '').replace(/\r\n?/g, '\n');
+      return escapeHtml(plain);
     }
 
     function buildWorksheetA4Data(topic) {
@@ -1619,7 +1739,7 @@
         ? `<div class="hskk-print-note-lines" style="padding: 3px 0 0; background: #ffffff;">
              ${Array.from({ length: 16 }).map(() => '<div style="height: 39px; border-bottom: 1px solid #dce2e9;"></div>').join('')}
            </div>`
-        : `<div class="hskk-print-note-text" style="background: #ffffff; border: 0; padding: 4px 0 8px; min-height: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; font-family: 'Noto Sans SC', 'Inter', sans-serif; font-size: 18px; font-weight: 400; line-height: 1.9; color: #172235;">${formattedNote}</div>`;
+        : `<div class="hskk-print-note-text" style="background: #ffffff; border: 0; padding: 4px 0 8px; min-height: 0; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; font-family: 'Noto Sans SC', 'Inter', sans-serif; font-size: 18px; font-weight: 400; line-height: 1.9; color: #172235;">${formattedNote}</div>`;
 
       const bodyHtml = `
         <article class="hskk-a4-worksheet" style="width: 100%; box-sizing: border-box; background: #ffffff; color: #172235; font-family: 'Inter', 'Noto Sans SC', sans-serif;">
@@ -1661,38 +1781,51 @@
 - Đặt thẻ render tạm tại left: 0; top: 0; z-index: -1; opacity: 1 để html2canvas luôn chụp được hình ảnh đầy đủ, không bao giờ ra trang trắng
 - Hỗ trợ tự động chia nhiều trang A4 khi nội dung bài nói dài
      */
-    // Find a nearly blank horizontal gap so page breaks avoid cutting through Hanzi.
-    // This works even for long, user-authored notes with arbitrary line breaks.
-    function findA4WhitespaceCut(canvas, startRow, maxRows) {
-      const limit = Math.min(canvas.height, startRow + maxRows);
-      if (limit >= canvas.height) return canvas.height;
-      const searchFrom = Math.max(startRow + Math.floor(maxRows * 0.58), limit - Math.round(canvas.width * 0.16));
-      const searchTo = Math.max(searchFrom + 1, limit - 9);
-      const ctx = canvas.getContext('2d', { willReadFrequently: true });
-      const strip = ctx.getImageData(0, searchFrom, canvas.width, searchTo - searchFrom);
-      const rgba = strip.data;
-      const stepX = 5;
-      let bestRow = searchTo - 1;
-      let bestScore = Infinity;
-      const lowInkRows = [];
-      for (let y = 0; y < strip.height; y += 2) {
-        let darkPixels = 0;
-        const rowOffset = y * canvas.width * 4;
-        for (let x = 8; x < canvas.width - 8; x += stepX) {
-          const k = rowOffset + x * 4;
-          // Ignore barely visible anti-aliasing; section borders contribute few pixels.
-          if (rgba[k] < 223 || rgba[k+1] < 223 || rgba[k+2] < 223) darkPixels++;
+    // Tìm điểm cắt dựa trên vị trí THỰC của các dòng chữ (getClientRects),
+    // không dùng pixel màu: nền tô sáng không còn bị nhầm là chữ để cắt ngang dòng.
+    function getA4SafeLineCuts(renderHost, canvasHeight) {
+      const hostTop = renderHost.getBoundingClientRect().top;
+      const pixelsPerCssPx = canvasHeight / renderHost.scrollHeight;
+      const boxes = [];
+      const walker = document.createTreeWalker(renderHost, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const textNode = walker.currentNode;
+        if (!textNode.nodeValue || !textNode.nodeValue.trim()) continue;
+        const range = document.createRange();
+        range.selectNodeContents(textNode);
+        for (const rect of Array.from(range.getClientRects())) {
+          if (rect.width < 1 || rect.height < 1) continue;
+          boxes.push({top: Math.max(0, (rect.top - hostTop) * pixelsPerCssPx),
+                      bottom: Math.min(canvasHeight, (rect.bottom - hostTop) * pixelsPerCssPx)});
         }
-        const absRow = searchFrom + y;
-        const isGap = darkPixels <= Math.max(3, Math.floor((canvas.width / stepX) * .008));
-        if (isGap) lowInkRows.push(absRow);
-        // Prefer the closest clear gap to the bottom of the available A4 area.
-        const score = darkPixels * 20 + (limit - absRow) * .10;
-        if (score < bestScore) { bestScore = score; bestRow = absRow; }
       }
-      const candidate = lowInkRows.length ? lowInkRows[lowInkRows.length - 1] : bestRow;
-      // Keep each page moving forward; prevent endless loops in pathological images.
-      return Math.max(startRow + Math.floor(maxRows * .55), Math.min(limit - 2, candidate));
+      // Mark có nền chiếm toàn bộ line box, tính cả chiều cao nền tô để không cắt ngang màu.
+      for (const mark of renderHost.querySelectorAll('mark[data-note-highlight]')) {
+        for (const rect of Array.from(mark.getClientRects())) {
+          if (rect.width < 1 || rect.height < 1) continue;
+          boxes.push({top: Math.max(0, (rect.top - hostTop) * pixelsPerCssPx),
+                      bottom: Math.min(canvasHeight, (rect.bottom - hostTop) * pixelsPerCssPx)});
+        }
+      }
+      boxes.sort((a, b) => a.top - b.top || a.bottom - b.bottom);
+      return boxes;
+    }
+
+    function findA4MeasuredCut(boxes, startRow, maxRows, totalRows) {
+      const limit = Math.min(totalRows, startRow + maxRows);
+      if (limit >= totalRows) return totalRows;
+      const minimum = startRow + maxRows * .55;
+      // Tìm khoảng giữa 2 dòng nằm phía trên cuối trang, không cắt chữ/tô sáng.
+      const occupied = boxes.filter(b => b.bottom > startRow && b.top < limit);
+      const endings = [...new Set(occupied.map(b => Math.ceil(b.bottom + 3)))].sort((a,b) => b-a);
+      for (const boundary of endings) {
+        if (boundary < minimum || boundary > limit - 3) continue;
+        if (boxes.every(b => b.bottom <= boundary - 2 || b.top >= boundary + 2)) return boundary;
+      }
+      // Fallback: tránh cắt một glyph; nếu dòng quá sát cuối trang thì lùi về đầu dòng.
+      const crossings = boxes.filter(b => b.top < limit && b.bottom > limit);
+      const safe = crossings.length ? Math.floor(Math.min(...crossings.map(b => b.top)) - 4) : limit;
+      return Math.max(startRow + 1, Math.min(limit, safe));
     }
 
     /**
@@ -1730,10 +1863,11 @@
         const usableWidth = 180;
         const printableHeight = 260; // Reserve 11mm for quiet footer and page numbering.
         const maxRows = Math.floor(canvas.width * printableHeight / usableWidth);
+        const lineBoxes = getA4SafeLineCuts(renderHost, canvas.height);
         const chunks = [];
         let startRow = 0;
         while (startRow < canvas.height) {
-          const cut = findA4WhitespaceCut(canvas, startRow, maxRows);
+          const cut = findA4MeasuredCut(lineBoxes, startRow, maxRows, canvas.height);
           const heightRows = cut - startRow;
           if (heightRows <= 0) throw new Error('Không thể ngắt trang PDF hợp lệ.');
           chunks.push({ top: startRow, height: heightRows });
@@ -1749,10 +1883,10 @@
           pageCtx.fillStyle = '#ffffff';
           pageCtx.fillRect(0, 0, pageCanvas.width, pageCanvas.height);
           pageCtx.drawImage(canvas, 0, chunk.top, canvas.width, chunk.height, 0, 0, canvas.width, chunk.height);
-          const image = pageCanvas.toDataURL('image/jpeg', .94);
+          const image = pageCanvas.toDataURL('image/png');
           if (i > 0) pdf.addPage();
           const imageHeight = chunk.height * usableWidth / canvas.width;
-          pdf.addImage(image, 'JPEG', marginX, topY, usableWidth, imageHeight);
+          pdf.addImage(image, 'PNG', marginX, topY, usableWidth, imageHeight);
           // Unobtrusive white paper footer, kept outside content area.
           pdf.setDrawColor(226, 232, 240);
           pdf.setLineWidth(.25);
